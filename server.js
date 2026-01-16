@@ -1,17 +1,19 @@
 import express from 'express';
 import crypto from 'node:crypto';
 
-// --- ENV (one Shopify token per region/shop) ---
+// --- ENV (one Shopify Admin token per region/shop) ---
 const {
   SHOP_DOMAIN_UK, SHOP_DOMAIN_EU, SHOP_DOMAIN_US,
   SHOPIFY_ADMIN_TOKEN_UK, SHOPIFY_ADMIN_TOKEN_EU, SHOPIFY_ADMIN_TOKEN_US,
-  FLOW_SECRET_UK, FLOW_SECRET_EU, FLOW_SECRET_US,
   SHOPIFY_API_VERSION = '2025-07',
+  // Keep the same optional shared-secret pattern as your existing service.
+  // If you do NOT want to use secrets in Flow, leave these unset in Render.
+  FLOW_SECRET_UK, FLOW_SECRET_EU, FLOW_SECRET_US,
   FETCH_TIMEOUT_MS = '10000',
   DEBUG_ERRORS = 'false'
 } = process.env;
 
-// Map shops -> region config (same pattern as your Seal proxy)
+// Map shops -> region config (same pattern as your existing server.js)
 const regions = [
   { code: 'UK', shop: SHOP_DOMAIN_UK, adminToken: SHOPIFY_ADMIN_TOKEN_UK, flowSecret: FLOW_SECRET_UK },
   { code: 'EU', shop: SHOP_DOMAIN_EU, adminToken: SHOPIFY_ADMIN_TOKEN_EU, flowSecret: FLOW_SECRET_EU },
@@ -19,7 +21,7 @@ const regions = [
 ].filter(r => r.shop);
 
 const byShop = new Map(regions.map(r => [r.shop, r]));
-const isValidShop = s => /^[a-z0-9-]+\.myshopify\.com$/.test(s);
+const isValidShop = s => /^[a-z0-9-]+\.myshopify\.com$/.test(String(s || ''));
 
 const tscEq = (a, b) => {
   const A = Buffer.from(String(a || ''), 'utf8');
@@ -49,8 +51,8 @@ async function timedFetch(url, options = {}) {
 
 function safeJson(txt) { try { return JSON.parse(txt); } catch { return null; } }
 
-function toOrderGid(maybeNumericOrGid) {
-  const s = String(maybeNumericOrGid || '');
+function toOrderGid(maybeGidOrNumeric) {
+  const s = String(maybeGidOrNumeric || '');
   if (!s) return null;
   if (s.startsWith('gid://shopify/Order/')) return s;
   if (/^\d+$/.test(s)) return `gid://shopify/Order/${s}`;
@@ -73,9 +75,11 @@ async function shopifyGraphQL({ region, query, variables }) {
 
   const text = await r.text();
   const json = safeJson(text);
+
   if (!r.ok) throw new Error(`Shopify GraphQL HTTP ${r.status}: ${text.slice(0, 800)}`);
   if (!json) throw new Error(`Shopify GraphQL non-JSON: ${text.slice(0, 800)}`);
   if (json.errors?.length) throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors).slice(0, 1200)}`);
+
   return json.data;
 }
 
@@ -89,7 +93,8 @@ app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     shops: regions.map(r => r.shop),
-    shopifyConfigured: Object.fromEntries(regions.map(r => [r.code, Boolean(r.adminToken)]))
+    shopifyConfigured: Object.fromEntries(regions.map(r => [r.code, Boolean(r.adminToken)])),
+    apiVersion: SHOPIFY_API_VERSION
   });
 });
 
@@ -99,25 +104,33 @@ app.get('/health', (_req, res) => {
  * Body:
  * {
  *   "shopDomain": "{{shop.myshopifyDomain}}",
- *   "orderGid": "{{order.id}}",            // preferred
- *   "orderId":  "{{order.id | split:'/' | last}}",  // optional fallback (numeric)
+ *   "orderGid": "{{order.id}}",           // preferred
+ *   "orderId":  "1234567890",             // optional fallback
  *   "targetShippingTitle": "DHL_PAKET::Standard",
  *   "dryRun": false
  * }
  *
- * If you set FLOW_SECRET_* for a shop, include header: X-Flow-Secret: <that secret>
+ * OPTIONAL header (only if you set FLOW_SECRET_* env vars):
+ *   X-Flow-Secret: <that secret>
+ *
+ * If you do NOT want to reference secrets in Flow, leave FLOW_SECRET_* unset in Render
+ * and this endpoint will not enforce the header.
  */
 app.post('/flow/edit-shipping-lines', async (req, res) => {
   try {
     const { shopDomain, orderGid, orderId, targetShippingTitle, dryRun = false } = req.body || {};
-    if (!shopDomain || !isValidShop(shopDomain)) return errRes(res, 400, 'Missing/invalid shopDomain', shopDomain);
+
+    if (!shopDomain || !isValidShop(shopDomain)) {
+      return errRes(res, 400, 'Missing/invalid shopDomain', shopDomain);
+    }
 
     const region = byShop.get(shopDomain);
     if (!region) return errRes(res, 400, `Shop not recognized: ${shopDomain}`);
 
-    // optional shared secret (same behavior as your current service)
-    if (region.flowSecret && !tscEq(req.header('X-Flow-Secret'), region.flowSecret)) {
-      return errRes(res, 401, 'Bad X-Flow-Secret');
+    // Optional shared secret (same pattern as your existing service)
+    if (region.flowSecret) {
+      const headerSecret = req.header('X-Flow-Secret');
+      if (!tscEq(headerSecret, region.flowSecret)) return errRes(res, 401, 'Bad X-Flow-Secret');
     }
 
     const gid = toOrderGid(orderGid) || toOrderGid(orderId);
@@ -127,7 +140,7 @@ app.post('/flow/edit-shipping-lines', async (req, res) => {
       return errRes(res, 400, 'Missing targetShippingTitle');
     }
 
-    // 1) Fetch order + first shipping line + price
+    // 1) Fetch current order shipping line + price
     const GET_ORDER = `
       query GetOrder($id: ID!) {
         order(id: $id) {
