@@ -161,23 +161,40 @@ app.post('/flow/edit-shipping-lines', async (req, res) => {
     const order = d1.order;
     if (!order) return errRes(res, 404, 'Order not found');
 
-    const current = order.shippingLines?.nodes?.[0];
-    if (!current) return errRes(res, 400, 'Order has no shipping lines');
+    const current = order.shippingLines?.nodes?.[0] || null;
+
+// If there's no current shipping line, we will ADD one.
+// We need a price. Default to 0 unless the caller provides it.
+const explicitPrice = targetShippingPrice !== undefined && targetShippingPrice !== null
+  ? parseFloat(targetShippingPrice)
+  : null;
+
+let price;
+if (current) {
+  const amountStr = current.originalPriceSet?.shopMoney?.amount;
+  price = parseFloat(amountStr);
+  if (!Number.isFinite(price)) return errRes(res, 500, 'Invalid existing shipping price', amountStr);
+} else {
+  price = explicitPrice ?? 0;
+  if (!Number.isFinite(price)) return errRes(res, 400, 'Invalid targetShippingPrice', targetShippingPrice);
+}
+
 
     const amountStr = current.originalPriceSet?.shopMoney?.amount;
     const price = parseFloat(amountStr);
     if (!Number.isFinite(price)) return errRes(res, 500, 'Invalid shipping price', amountStr);
 
     if (dryRun) {
-      return res.json({
-        ok: true,
-        dryRun: true,
-        shopDomain,
-        orderName: order.name,
-        from: { id: current.id, title: current.title, price },
-        to: { title: targetShippingTitle, price }
-      });
-    }
+  return res.json({
+    ok: true,
+    dryRun: true,
+    shopDomain,
+    orderName: order.name,
+    mode: current ? 'replace' : 'add',
+    from: current ? { id: current.id, title: current.title, price } : null,
+    to: { title: targetShippingTitle, price }
+  });
+}
 
     // 2) Begin order edit
     const ORDER_EDIT_BEGIN = `
@@ -209,21 +226,23 @@ app.post('/flow/edit-shipping-lines', async (req, res) => {
     });
     assertUserErrors('orderEditAddShippingLine', d3.orderEditAddShippingLine);
 
-    // 4) Remove old shipping line
-    const ORDER_EDIT_REMOVE = `
-      mutation Remove($id: ID!, $shippingLineId: ID!) {
-        orderEditRemoveShippingLine(id: $id, shippingLineId: $shippingLineId) {
-          calculatedOrder { id }
-          userErrors { field message }
-        }
+    // 4) Remove old shipping line (ONLY if there was one)
+if (current) {
+  const ORDER_EDIT_REMOVE = `
+    mutation Remove($id: ID!, $shippingLineId: ID!) {
+      orderEditRemoveShippingLine(id: $id, shippingLineId: $shippingLineId) {
+        calculatedOrder { id }
+        userErrors { field message }
       }
-    `;
-    const d4 = await shopifyGraphQL({
-      region,
-      query: ORDER_EDIT_REMOVE,
-      variables: { id: calculatedOrderId, shippingLineId: current.id }
-    });
-    assertUserErrors('orderEditRemoveShippingLine', d4.orderEditRemoveShippingLine);
+    }
+  `;
+  const d4 = await shopifyGraphQL({
+    region,
+    query: ORDER_EDIT_REMOVE,
+    variables: { id: calculatedOrderId, shippingLineId: current.id }
+  });
+  assertUserErrors('orderEditRemoveShippingLine', d4.orderEditRemoveShippingLine);
+}
 
     // 5) Commit
     const ORDER_EDIT_COMMIT = `
