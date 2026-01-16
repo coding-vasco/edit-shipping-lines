@@ -101,24 +101,62 @@ app.get('/health', (_req, res) => {
 // ---------- Flow → Order created -> edit shipping lines ----------
 /**
  * POST /flow/edit-shipping-lines
- * Body:
+ *
+ * Purpose
+ * -------
+ * Normalizes / injects a shipping line on an order for 3PL mapping.
+ * The service automatically selects the correct Shopify Admin token
+ * based on `shopDomain` (no environment variables or secrets required in Flow).
+ *
+ * Supported modes
+ * ---------------
+ * 1) REPLACE
+ *    - If the order already has a shipping line:
+ *      • Adds a new shipping line with `targetShippingTitle`
+ *      • Reuses the existing shipping price
+ *      • Removes the old shipping line
+ *
+ * 2) ADD
+ *    - If the order has NO shipping lines:
+ *      • Adds a new shipping line with `targetShippingTitle`
+ *      • Uses `targetShippingPrice` if provided, otherwise defaults to 0
+ *
+ * Body
+ * ----
  * {
- *   "shopDomain": "{{shop.myshopifyDomain}}",
- *   "orderGid": "{{order.id}}",           // preferred
- *   "orderId":  "1234567890",             // optional fallback
- *   "targetShippingTitle": "DHL_PAKET::Standard",
- *   "dryRun": false
+ *   "shopDomain": "{{shop.myshopifyDomain}}",     // required
+ *   "orderGid": "{{order.id}}",                  // preferred (gid://shopify/Order/…)
+ *   "orderId": "1234567890",                     // optional numeric fallback
+ *   "targetShippingTitle": "DHL_PAKET::Standard",// required (3PL-normalized title)
+ *   "targetShippingPrice": 0,                    // optional (used only if no shipping line exists)
+ *   "dryRun": false                              // optional (true = no write, preview only)
  * }
  *
- * OPTIONAL header (only if you set FLOW_SECRET_* env vars):
- *   X-Flow-Secret: <that secret>
+ * Headers
+ * -------
+ * Optional (only if FLOW_SECRET_* env vars are set in Render):
+ *   X-Flow-Secret: <per-shop secret>
  *
- * If you do NOT want to reference secrets in Flow, leave FLOW_SECRET_* unset in Render
- * and this endpoint will not enforce the header.
+ * Notes
+ * -----
+ * - Flow should ONLY send `shopDomain` + order identifiers.
+ *   All shop/token resolution happens server-side.
+ * - `dryRun=true` returns the detected mode ("add" | "replace")
+ *   and the computed shipping price without mutating the order.
+ * - Shipping line "code" is not modified; 3PL mapping must rely
+ *   on `targetShippingTitle` (recommended format: CODE::Human Name).
  */
+
 app.post('/flow/edit-shipping-lines', async (req, res) => {
   try {
-    const { shopDomain, orderGid, orderId, targetShippingTitle, dryRun = false } = req.body || {};
+    const {
+      shopDomain,
+      orderGid,
+      orderId,
+      targetShippingTitle,
+      targetShippingPrice,
+      dryRun = false
+    } = req.body || {};
 
     if (!shopDomain || !isValidShop(shopDomain)) {
       return errRes(res, 400, 'Missing/invalid shopDomain', shopDomain);
@@ -127,7 +165,6 @@ app.post('/flow/edit-shipping-lines', async (req, res) => {
     const region = byShop.get(shopDomain);
     if (!region) return errRes(res, 400, `Shop not recognized: ${shopDomain}`);
 
-    // Optional shared secret (same pattern as your existing service)
     if (region.flowSecret) {
       const headerSecret = req.header('X-Flow-Secret');
       if (!tscEq(headerSecret, region.flowSecret)) return errRes(res, 401, 'Bad X-Flow-Secret');
@@ -140,7 +177,7 @@ app.post('/flow/edit-shipping-lines', async (req, res) => {
       return errRes(res, 400, 'Missing targetShippingTitle');
     }
 
-    // 1) Fetch current order shipping line + price
+    // 1) Fetch order + shipping lines
     const GET_ORDER = `
       query GetOrder($id: ID!) {
         order(id: $id) {
@@ -163,38 +200,34 @@ app.post('/flow/edit-shipping-lines', async (req, res) => {
 
     const current = order.shippingLines?.nodes?.[0] || null;
 
-// If there's no current shipping line, we will ADD one.
-// We need a price. Default to 0 unless the caller provides it.
-const explicitPrice = targetShippingPrice !== undefined && targetShippingPrice !== null
-  ? parseFloat(targetShippingPrice)
-  : null;
+    // Determine price:
+    // - If replacing: reuse existing price
+    // - If adding: use caller price (default 0)
+    let price;
+    if (current) {
+      const amountStr = current.originalPriceSet?.shopMoney?.amount;
+      price = parseFloat(amountStr);
+      if (!Number.isFinite(price)) return errRes(res, 500, 'Invalid existing shipping price', amountStr);
+    } else {
+      const p = (targetShippingPrice === undefined || targetShippingPrice === null)
+        ? 0
+        : parseFloat(targetShippingPrice);
 
-let price;
-if (current) {
-  const amountStr = current.originalPriceSet?.shopMoney?.amount;
-  price = parseFloat(amountStr);
-  if (!Number.isFinite(price)) return errRes(res, 500, 'Invalid existing shipping price', amountStr);
-} else {
-  price = explicitPrice ?? 0;
-  if (!Number.isFinite(price)) return errRes(res, 400, 'Invalid targetShippingPrice', targetShippingPrice);
-}
-
-
-    const amountStr = current.originalPriceSet?.shopMoney?.amount;
-    const price = parseFloat(amountStr);
-    if (!Number.isFinite(price)) return errRes(res, 500, 'Invalid shipping price', amountStr);
+      if (!Number.isFinite(p)) return errRes(res, 400, 'Invalid targetShippingPrice', targetShippingPrice);
+      price = p;
+    }
 
     if (dryRun) {
-  return res.json({
-    ok: true,
-    dryRun: true,
-    shopDomain,
-    orderName: order.name,
-    mode: current ? 'replace' : 'add',
-    from: current ? { id: current.id, title: current.title, price } : null,
-    to: { title: targetShippingTitle, price }
-  });
-}
+      return res.json({
+        ok: true,
+        dryRun: true,
+        shopDomain,
+        orderName: order.name,
+        mode: current ? 'replace' : 'add',
+        from: current ? { id: current.id, title: current.title, price } : null,
+        to: { title: targetShippingTitle, price }
+      });
+    }
 
     // 2) Begin order edit
     const ORDER_EDIT_BEGIN = `
@@ -210,7 +243,7 @@ if (current) {
     const calculatedOrderId = d2.orderEditBegin?.calculatedOrder?.id;
     if (!calculatedOrderId) return errRes(res, 500, 'Missing calculatedOrderId');
 
-    // 3) Add new shipping line (same price, new title)
+    // 3) Add new shipping line
     const ORDER_EDIT_ADD = `
       mutation Add($id: ID!, $title: String!, $price: Money!) {
         orderEditAddShippingLine(id: $id, shippingLine: { title: $title, price: $price }) {
@@ -226,23 +259,23 @@ if (current) {
     });
     assertUserErrors('orderEditAddShippingLine', d3.orderEditAddShippingLine);
 
-    // 4) Remove old shipping line (ONLY if there was one)
-if (current) {
-  const ORDER_EDIT_REMOVE = `
-    mutation Remove($id: ID!, $shippingLineId: ID!) {
-      orderEditRemoveShippingLine(id: $id, shippingLineId: $shippingLineId) {
-        calculatedOrder { id }
-        userErrors { field message }
-      }
+    // 4) Remove old shipping line only if it existed
+    if (current) {
+      const ORDER_EDIT_REMOVE = `
+        mutation Remove($id: ID!, $shippingLineId: ID!) {
+          orderEditRemoveShippingLine(id: $id, shippingLineId: $shippingLineId) {
+            calculatedOrder { id }
+            userErrors { field message }
+          }
+        }
+      `;
+      const d4 = await shopifyGraphQL({
+        region,
+        query: ORDER_EDIT_REMOVE,
+        variables: { id: calculatedOrderId, shippingLineId: current.id }
+      });
+      assertUserErrors('orderEditRemoveShippingLine', d4.orderEditRemoveShippingLine);
     }
-  `;
-  const d4 = await shopifyGraphQL({
-    region,
-    query: ORDER_EDIT_REMOVE,
-    variables: { id: calculatedOrderId, shippingLineId: current.id }
-  });
-  assertUserErrors('orderEditRemoveShippingLine', d4.orderEditRemoveShippingLine);
-}
 
     // 5) Commit
     const ORDER_EDIT_COMMIT = `
@@ -260,8 +293,8 @@ if (current) {
       ok: true,
       shopDomain,
       orderName: order.name,
-      replaced: true,
-      from: { id: current.id, title: current.title, price },
+      mode: current ? 'replace' : 'add',
+      from: current ? { id: current.id, title: current.title, price } : null,
       to: { title: targetShippingTitle, price }
     });
   } catch (e) {
@@ -270,8 +303,3 @@ if (current) {
   }
 });
 
-// ---------- start ----------
-const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`✅ edit-shipping-lines listening on :${port}`);
-});
