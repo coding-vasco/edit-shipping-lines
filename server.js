@@ -27,9 +27,9 @@ const {
 
 // Map shops -> region config
 const regions = [
-  { code: 'UK', shop: SHOP_DOMAIN_UK, adminToken: SHOPIFY_ADMIN_TOKEN_UK, flowSecret: FLOW_SECRET_UK },
-  { code: 'EU', shop: SHOP_DOMAIN_EU, adminToken: SHOPIFY_ADMIN_TOKEN_EU, flowSecret: FLOW_SECRET_EU },
-  { code: 'US', shop: SHOP_DOMAIN_US, adminToken: SHOPIFY_ADMIN_TOKEN_US, flowSecret: FLOW_SECRET_US },
+  { code: 'UK', shop: SHOP_DOMAIN_UK, adminToken: SHOPIFY_ADMIN_TOKEN_UK, flowSecret: FLOW_SECRET_UK, currencyCode: 'GBP' },
+  { code: 'EU', shop: SHOP_DOMAIN_EU, adminToken: SHOPIFY_ADMIN_TOKEN_EU, flowSecret: FLOW_SECRET_EU, currencyCode: 'EUR' },
+  { code: 'US', shop: SHOP_DOMAIN_US, adminToken: SHOPIFY_ADMIN_TOKEN_US, flowSecret: FLOW_SECRET_US, currencyCode: 'USD' },
 ].filter(r => r.shop);
 
 const byShop = new Map(regions.map(r => [r.shop, r]));
@@ -195,7 +195,9 @@ app.post('/flow/edit-shipping-lines', async (req, res) => {
             nodes {
               id
               title
-              originalPriceSet { shopMoney { amount currencyCode } }
+              originalPriceSet {
+                shopMoney { amount currencyCode }
+              }
             }
           }
         }
@@ -209,21 +211,37 @@ app.post('/flow/edit-shipping-lines', async (req, res) => {
     const current = order.shippingLines?.nodes?.[0] || null;
 
     // Determine price:
-    // - If replacing: reuse existing price
-    // - If adding: use caller price (default 0)
-    let price;
+    // - If replacing: reuse existing price + currency
+    // - If adding: use caller price (default 0) + a currency fallback
+    let priceNumber;
+    let currencyCode;
+
     if (current) {
-      const amountStr = current.originalPriceSet?.shopMoney?.amount;
-      price = parseFloat(amountStr);
-      if (!Number.isFinite(price)) return errRes(res, 500, 'Invalid existing shipping price', amountStr);
+      const money = current.originalPriceSet?.shopMoney;
+      const amountStr = money?.amount;
+      currencyCode = money?.currencyCode;
+
+      priceNumber = parseFloat(amountStr);
+      if (!Number.isFinite(priceNumber)) return errRes(res, 500, 'Invalid existing shipping price', amountStr);
+      if (!currencyCode) return errRes(res, 500, 'Missing existing shipping currencyCode');
     } else {
       const p = (targetShippingPrice === undefined || targetShippingPrice === null)
         ? 0
         : parseFloat(targetShippingPrice);
 
       if (!Number.isFinite(p)) return errRes(res, 400, 'Invalid targetShippingPrice', targetShippingPrice);
-      price = p;
+      priceNumber = p;
+
+      // Fallback currency if order has no shipping line.
+      // If you ever hit non-USD stores, set this per shop (e.g., SHOP_CURRENCY_UK=GBP) or fetch order currency via another field.
+      currencyCode = region.currencyCode || 'USD';
     }
+
+    // Shopify expects MoneyInput: { amount: "0.00", currencyCode: USD }
+    const priceInput = {
+      amount: priceNumber.toFixed(2),
+      currencyCode
+    };
 
     if (dryRun) {
       return res.json({
@@ -232,8 +250,8 @@ app.post('/flow/edit-shipping-lines', async (req, res) => {
         shopDomain,
         orderName: order.name,
         mode: current ? 'replace' : 'add',
-        from: current ? { id: current.id, title: current.title, price } : null,
-        to: { title: targetShippingTitle, price }
+        from: current ? { id: current.id, title: current.title, price: priceInput } : null,
+        to: { title: targetShippingTitle, price: priceInput }
       });
     }
 
@@ -252,19 +270,23 @@ app.post('/flow/edit-shipping-lines', async (req, res) => {
     const calculatedOrderId = d2.orderEditBegin?.calculatedOrder?.id;
     if (!calculatedOrderId) return errRes(res, 500, 'Missing calculatedOrderId');
 
-    // 3) Add new shipping line
+    // 3) Add new shipping line (MoneyInput!)
     const ORDER_EDIT_ADD = `
-      mutation Add($id: ID!, $title: String!, $price: Money!) {
-        orderEditAddShippingLine(id: $id, shippingLine: { title: $title, price: $price }) {
+      mutation Add($id: ID!, $title: String!, $price: MoneyInput!) {
+        orderEditAddShippingLine(
+          id: $id,
+          shippingLine: { title: $title, price: $price }
+        ) {
           calculatedOrder { id }
           userErrors { field message }
         }
       }
     `;
+
     const d3 = await shopifyGraphQL({
       region,
       query: ORDER_EDIT_ADD,
-      variables: { id: calculatedOrderId, title: targetShippingTitle, price }
+      variables: { id: calculatedOrderId, title: targetShippingTitle, price: priceInput }
     });
     assertUserErrors('orderEditAddShippingLine', d3.orderEditAddShippingLine);
 
@@ -303,11 +325,12 @@ app.post('/flow/edit-shipping-lines', async (req, res) => {
       shopDomain,
       orderName: order.name,
       mode: current ? 'replace' : 'add',
-      from: current ? { id: current.id, title: current.title, price } : null,
-      to: { title: targetShippingTitle, price }
+      from: current ? { id: current.id, title: current.title, price: priceInput } : null,
+      to: { title: targetShippingTitle, price: priceInput }
     });
   } catch (e) {
     console.error('edit-shipping-lines error', e);
+    // Keep message generic unless debug=true
     return errRes(res, 500, 'Server error', e.stack || String(e));
   }
 });
