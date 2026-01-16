@@ -1,3 +1,8 @@
+import 'dotenv/config';
+import express from 'express';
+import crypto from 'node:crypto';
+
+// --- crash visibility (Render) ---
 process.on('uncaughtException', (err) => {
   console.error('UNCAUGHT EXCEPTION:', err);
   process.exit(1);
@@ -10,23 +15,18 @@ process.on('unhandledRejection', (reason) => {
 
 console.log('Booting edit-shipping-lines...');
 
-
-import express from 'express';
-import crypto from 'node:crypto';
-
 // --- ENV (one Shopify Admin token per region/shop) ---
 const {
   SHOP_DOMAIN_UK, SHOP_DOMAIN_EU, SHOP_DOMAIN_US,
   SHOPIFY_ADMIN_TOKEN_UK, SHOPIFY_ADMIN_TOKEN_EU, SHOPIFY_ADMIN_TOKEN_US,
   SHOPIFY_API_VERSION = '2025-07',
-  // Keep the same optional shared-secret pattern as your existing service.
-  // If you do NOT want to use secrets in Flow, leave these unset in Render.
+  // Optional shared-secret pattern. If you do NOT want to use secrets in Flow, leave these unset in Render.
   FLOW_SECRET_UK, FLOW_SECRET_EU, FLOW_SECRET_US,
   FETCH_TIMEOUT_MS = '10000',
   DEBUG_ERRORS = 'false'
 } = process.env;
 
-// Map shops -> region config (same pattern as your existing server.js)
+// Map shops -> region config
 const regions = [
   { code: 'UK', shop: SHOP_DOMAIN_UK, adminToken: SHOPIFY_ADMIN_TOKEN_UK, flowSecret: FLOW_SECRET_UK },
   { code: 'EU', shop: SHOP_DOMAIN_EU, adminToken: SHOPIFY_ADMIN_TOKEN_EU, flowSecret: FLOW_SECRET_EU },
@@ -137,12 +137,12 @@ app.get('/health', (_req, res) => {
  * Body
  * ----
  * {
- *   "shopDomain": "{{shop.myshopifyDomain}}",     // required
- *   "orderGid": "{{order.id}}",                  // preferred (gid://shopify/Order/…)
- *   "orderId": "1234567890",                     // optional numeric fallback
- *   "targetShippingTitle": "DHL_PAKET::Standard",// required (3PL-normalized title)
- *   "targetShippingPrice": 0,                    // optional (used only if no shipping line exists)
- *   "dryRun": false                              // optional (true = no write, preview only)
+ *   "shopDomain": "{{shop.myshopifyDomain}}",      // required
+ *   "orderGid": "{{order.id}}",                   // preferred (gid://shopify/Order/…)
+ *   "orderId": "1234567890",                      // optional numeric fallback
+ *   "targetShippingTitle": "DHL_PAKET::Standard", // required (3PL-normalized title)
+ *   "targetShippingPrice": 0,                     // optional (used only if no shipping line exists)
+ *   "dryRun": false                               // optional (true = no write, preview only)
  * }
  *
  * Headers
@@ -152,14 +152,10 @@ app.get('/health', (_req, res) => {
  *
  * Notes
  * -----
- * - Flow should ONLY send `shopDomain` + order identifiers.
- *   All shop/token resolution happens server-side.
- * - `dryRun=true` returns the detected mode ("add" | "replace")
- *   and the computed shipping price without mutating the order.
- * - Shipping line "code" is not modified; 3PL mapping must rely
- *   on `targetShippingTitle` (recommended format: CODE::Human Name).
+ * - `dryRun=true` returns mode ("add" | "replace") and computed price without mutating the order.
+ * - Shipping line "code" is not modified; 3PL mapping must rely on `targetShippingTitle`
+ *   (recommended format: CODE::Human Name).
  */
-
 app.post('/flow/edit-shipping-lines', async (req, res) => {
   try {
     const {
@@ -253,6 +249,7 @@ app.post('/flow/edit-shipping-lines', async (req, res) => {
     `;
     const d2 = await shopifyGraphQL({ region, query: ORDER_EDIT_BEGIN, variables: { id: gid } });
     assertUserErrors('orderEditBegin', d2.orderEditBegin);
+
     const calculatedOrderId = d2.orderEditBegin?.calculatedOrder?.id;
     if (!calculatedOrderId) return errRes(res, 500, 'Missing calculatedOrderId');
 
@@ -316,3 +313,11 @@ app.post('/flow/edit-shipping-lines', async (req, res) => {
   }
 });
 
+// ---------- start ----------
+const port = process.env.PORT || 10000;
+
+console.log(`Starting HTTP server on port ${port}...`);
+
+app.listen(port, '0.0.0.0', () => {
+  console.log(`✅ edit-shipping-lines listening on :${port}`);
+});
